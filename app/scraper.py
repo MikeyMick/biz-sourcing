@@ -7,10 +7,9 @@ import logging
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass, asdict
 from decimal import Decimal, InvalidOperation
-from typing import Iterable, Iterator
+from typing import Iterable
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,8 +23,6 @@ USER_AGENT = (
 )
 
 OUTPUT_CSV = os.getenv("SCRAPER_OUTPUT_CSV", "texas_businesses_for_sale.csv")
-MAX_PAGES_PER_SITE = int(os.getenv("SCRAPER_MAX_PAGES", "5"))
-REQUEST_DELAY_SECONDS = float(os.getenv("SCRAPER_DELAY_SECONDS", "2.0"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("SCRAPER_TIMEOUT_SECONDS", "25"))
 
 logging.basicConfig(
@@ -48,23 +45,6 @@ class Listing:
     summary: str
     listing_url: str
     source: str
-
-
-TEXAS_PATTERNS = [
-    r"\btexas\b",
-    r"\btx\b",
-    r"\bdallas\b",
-    r"\bhouston\b",
-    r"\baustin\b",
-    r"\bsan antonio\b",
-    r"\bfort worth\b",
-    r"\bel paso\b",
-]
-
-
-def looks_like_texas(*fields: str) -> bool:
-    haystack = " ".join((field or "") for field in fields).lower()
-    return any(re.search(pattern, haystack) for pattern in TEXAS_PATTERNS)
 
 
 def extract_city_state(location: str) -> tuple[str, str]:
@@ -111,34 +91,31 @@ class HttpClient:
         logger.info("fetch url=%s", url)
         response = self.session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
+        logger.info("fetched url=%s status=%s bytes=%s", url, response.status_code, len(response.text))
         return response.text
 
 
-def parse_bizquest(html: str, page_url: str) -> list[Listing]:
+def parse_bizbuysell(html: str, page_url: str) -> list[Listing]:
     soup = BeautifulSoup(html, "lxml")
-    cards = soup.select("article, .listing-card, .result, .search-result")
+    logger.info("page title=%s", soup.title.get_text(strip=True) if soup.title else "NO_TITLE")
+
+    cards = soup.select(".listingResult")
+    logger.info("listing card count=%s", len(cards))
+
     rows: list[Listing] = []
 
     for card in cards:
-        link = card.select_one("a[href]")
-        title_node = card.select_one("h2, h3, .listing-title")
-        price_node = card.select_one(".price, [class*='price']")
-        location_node = card.select_one(".location, [class*='location']")
-        category_node = card.select_one(".category, [class*='category']")
-        summary_node = card.select_one(".description, [class*='description'], p")
+        title = clean_text(card.select_one(".listingResult__title"))
+        price = clean_text(card.select_one(".listingResult__price"))
+        location = clean_text(card.select_one(".listingResult__location"))
+        summary = clean_text(card.select_one(".listingResult__description"))
 
-        title = clean_text(title_node)
-        price_raw = clean_text(price_node)
-        location = clean_text(location_node)
-        category = clean_text(category_node)
-        summary = clean_text(summary_node)
-        listing_url = link.get("href", "").strip() if link else ""
-        if listing_url.startswith("/"):
-            listing_url = f"https://www.bizquest.com{listing_url}"
+        link = card.select_one("a[href]")
+        url = link.get("href", "").strip() if link else ""
+        if url.startswith("/"):
+            url = f"https://www.bizbuysell.com{url}"
 
         if not title:
-            continue
-        if not looks_like_texas(title, location, summary, listing_url):
             continue
 
         city, state = extract_city_state(location)
@@ -146,33 +123,20 @@ def parse_bizquest(html: str, page_url: str) -> list[Listing]:
         rows.append(
             Listing(
                 title=title,
-                price_raw=price_raw,
-                price_amount_usd=normalize_money(price_raw),
+                price_raw=price,
+                price_amount_usd=normalize_money(price),
                 location=location,
                 city=city,
                 state=state,
-                category=category,
+                category="",
                 summary=summary,
-                listing_url=listing_url,
-                source="BizQuest",
+                listing_url=url,
+                source="BizBuySell",
             )
         )
 
+    logger.info("parsed rows=%s", len(rows))
     return rows
-
-
-def scrape_bizquest(client: HttpClient) -> Iterator[Listing]:
-    for page in range(1, MAX_PAGES_PER_SITE + 1):
-        url = f"https://www.bizquest.com/businesses-for-sale-in-texas-tx/?page={page}"
-        try:
-            html = client.get_html(url)
-            rows = parse_bizquest(html, url)
-            logger.info("parsed source=BizQuest url=%s rows=%s", url, len(rows))
-            for row in rows:
-                yield row
-        except Exception as exc:
-            logger.exception("failed source=BizQuest url=%s error=%s", url, exc)
-        time.sleep(REQUEST_DELAY_SECONDS)
 
 
 def dedupe(rows: Iterable[Listing]) -> list[Listing]:
@@ -199,7 +163,9 @@ def write_csv(rows: list[Listing], path: str) -> None:
 
 def main() -> int:
     client = HttpClient()
-    rows = list(scrape_bizquest(client))
+    url = "https://www.bizbuysell.com/texas-businesses-for-sale/"
+    html = client.get_html(url)
+    rows = parse_bizbuysell(html, url)
     final_rows = dedupe(rows)
     write_csv(final_rows, OUTPUT_CSV)
     return 0
